@@ -4,6 +4,9 @@ class RenderContext extends h3d.impl.RenderContext {
 
 	static inline var BUFFERING = false;
 
+	// Prevents separate alphahandling in alphachannel
+	public static var legacyAlphaHandling = false;
+
 	public var globalAlpha = 1.;
 	public var buffer : hxd.FloatBuffer;
 	public var bufPos : Int;
@@ -303,12 +306,15 @@ class RenderContext extends h3d.impl.RenderContext {
 			// this will get us good color but wrong alpha
 			#else
 			// accummulate correctly alpha values
-			if( blend == Alpha || blend == Add ) {
-				pass.blendAlphaSrc = One;
-				// when merging
-				if( inFilterBlend != null )
-					pass.blendSrc = One;
+			if(!legacyAlphaHandling) {
+				if( blend == Alpha || blend == Add ) {
+					pass.blendAlphaSrc = One;
+					// when merging
+					if( inFilterBlend != null )
+						pass.blendSrc = One;
+				}
 			}
+
 			#end
 		}
 		manager.fillParams(buffers, compiledShader, currentShaders);
