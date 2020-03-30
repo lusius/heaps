@@ -176,6 +176,12 @@ class GlDriver extends Driver {
 	**/
 	public static var outOfMemoryCheck = #if js false #else true #end;
 
+	// All framebuffers loaded with their appropriate attachements
+	// This is to prevent binding/unbinding during runtime more than once
+	public static var framebuffers = new Map<Framebuffer,Array<h3d.mat.Texture>>();
+	public static var framebufferLastFrameUsed = new Map<Framebuffer,Int>();
+	public static var currentFBO:Framebuffer = null; 
+
 	public function new(antiAlias=0) {
 		#if js
 		canvas = @:privateAccess hxd.Window.getInstance().canvas;
@@ -1341,6 +1347,10 @@ class GlDriver extends Driver {
 	}
 
 	override function end() {
+		// Determine what framebuffers should be kept for further usage
+		// based on usage on the last 10 frames
+		disposeOldFramebuffers();
+
 		// no gl finish or flush !
 	}
 
@@ -1376,16 +1386,6 @@ class GlDriver extends Driver {
 		#elseif (hlsdl || usegl)
 		gl.drawBuffers(k, CBUFFERS);
 		#end
-	}
-
-	function unbindTargets() {
-		if( curTarget != null && numTargets > 1 ) {
-			while( numTargets > 1 ) {
-				gl.framebufferTexture2D(GL.FRAMEBUFFER, GL.COLOR_ATTACHMENT0 + (--numTargets), GL.TEXTURE_2D, null, 0);
-				curTargets[numTargets] = null;
-			}
-			setDrawBuffers(1);
-		}
 	}
 
 	override function capturePixels(tex:h3d.mat.Texture, layer:Int, mipLevel:Int, ?region:h2d.col.IBounds) {
@@ -1429,11 +1429,164 @@ class GlDriver extends Driver {
 		return pixels;
 	}
 
+	/*
+	 */
+	public function clearEmptyFramebuffers() {
+		var toBeRemoved = [];
+		for(fbo => textures in framebuffers) {
+			// Try to find disposed textures
+			for(texture in textures) {
+				// this framebuffer contains a null texture. should be removed
+				if(texture.t == null) {
+					toBeRemoved.push(fbo);
+					break;
+				}
+			}
+		}
+
+		for(fbo in toBeRemoved) {
+			deleteFramebuffer(fbo);
+		}
+	}
+
+	public function disposeOldFramebuffers() {
+		var delete = [];
+		for(fbo in framebuffers.keys()) {
+			var lastFrame = framebufferLastFrameUsed.get(fbo);
+			if(frame - lastFrame > 10) {
+				delete.push(fbo);
+			}
+		}
+
+		for(fbo in delete) {
+			deleteFramebuffer(fbo);
+		}
+	}
+
+	public function deleteFramebuffer(fbo:Framebuffer) {
+		gl.deleteFramebuffer(fbo);
+		framebufferLastFrameUsed.remove(fbo);
+		framebuffers.remove(fbo);
+	}
+
+	/*
+	   Find framebuffer containing all there textures
+	   @param textures All textures needs to be attached to returned framebuffer
+	   @param createOnNotFound Create framebuffer and bind these textures if it doesn't exist
+	*/
+	public function getFramebuffer(textures:Array<h3d.mat.Texture>,createOnNotFound = true):Framebuffer {
+		clearEmptyFramebuffers();
+		if(textures == null) {
+			return cast 0;
+		}
+
+
+		var fbo:Framebuffer = cast -1;
+		var matching = 0;
+		for(fbo2 => fboTextures in framebuffers) {
+			fbo = fbo2;
+			matching=0;
+			// Same number of attachments must be present
+			if(fboTextures.length != textures.length) {
+				continue;
+			}
+			// Check matching textures
+			for(i in 0...fboTextures.length) {
+				if(fboTextures[i].t != null && fboTextures[i].t.t != textures[i].t.t) {
+					break;
+				}
+				matching++;
+			}
+
+			if(matching == textures.length) {
+				return fbo;
+			}
+		}
+
+		var mipLevel = 0;
+		var layer = 0;
+
+		if(createOnNotFound) {
+			var lastFbo:Framebuffer = cast currentFBO;
+			fbo = gl.createFramebuffer();
+			framebufferLastFrameUsed.set(fbo,frame);
+
+			// register this fbo with the textures
+			framebuffers.set(fbo,textures);
+			
+			// Now we make modifications
+			bindFramebuffer(fbo);
+
+
+			// Attach all fbo's needed
+			for(i in 0...textures.length) {
+				var tex = textures[i];
+				if( tex.flags.has(IsArray) ) {
+					gl.framebufferTextureLayer(GL.FRAMEBUFFER, GL.COLOR_ATTACHMENT0+i, tex.t.t, mipLevel, layer);
+				} else {
+					gl.framebufferTexture2D(GL.FRAMEBUFFER, GL.COLOR_ATTACHMENT0+i, tex.flags.has(Cube) ? CUBE_FACES[layer] : GL.TEXTURE_2D, tex.t.t, mipLevel);
+				}
+				if( tex.depthBuffer != null ) {
+					gl.framebufferRenderbuffer(GL.FRAMEBUFFER, GL.DEPTH_ATTACHMENT, GL.RENDERBUFFER, @:privateAccess tex.depthBuffer.b.r);
+					gl.framebufferRenderbuffer(GL.FRAMEBUFFER, GL.STENCIL_ATTACHMENT, GL.RENDERBUFFER, tex.depthBuffer.hasStencil() ? @:privateAccess tex.depthBuffer.b.r : null);
+				} else {
+					gl.framebufferRenderbuffer(GL.FRAMEBUFFER, GL.DEPTH_ATTACHMENT, GL.RENDERBUFFER, null);
+					gl.framebufferRenderbuffer(GL.FRAMEBUFFER, GL.STENCIL_ATTACHMENT, GL.RENDERBUFFER, null);
+				}	
+			}
+
+			#if js
+			if( glDebug ) {
+				var code = gl.checkFramebufferStatus(GL.FRAMEBUFFER);
+				if( code != GL.FRAMEBUFFER_COMPLETE )
+					throw "Invalid frame buffer: "+code;
+			}
+			#end
+			bindFramebuffer(lastFbo);
+			return fbo;
+		}
+
+		return null;
+	}
+
+	public function bindFramebuffer(fbo:Framebuffer) {
+		currentFBO = fbo;
+
+		// Reset targets
+		for(i in 0...numTargets) {
+			curTargets[i] = null;
+		}
+		numTargets=0;
+		curTarget=null;	
+
+		if(fbo != null) {
+
+			// Register framebuffer used this frame
+			framebufferLastFrameUsed.set(fbo,frame);
+
+			// Set new targets based on bound to this fbo
+			var textures = framebuffers.get(fbo);
+
+			// Assign first
+			curTarget = textures[0];
+			numTargets++;
+
+			// Multi target fbo requires special care
+			if(textures.length > 0) {
+				for(i in 1...textures.length) {
+					curTargets[i] = textures[i];
+					numTargets++;
+				}
+			}
+		}
+
+		gl.bindFramebuffer(GL.FRAMEBUFFER,fbo);
+	}
+
 	override function setRenderTarget( tex : h3d.mat.Texture, layer = 0, mipLevel = 0 ) {
-		unbindTargets();
-		curTarget = tex;
+		
 		if( tex == null ) {
-			gl.bindFramebuffer(GL.FRAMEBUFFER, null);
+			bindFramebuffer(null);
 			gl.viewport(0, 0, bufferWidth, bufferHeight);
 			return;
 		}
@@ -1457,43 +1610,19 @@ class GlDriver extends Driver {
 		tex.lastFrame = frame;
 		curTargetLayer = layer;
 		curTargetMip = mipLevel;
+
 		#if multidriver
 		if( tex.t.driver != this )
 			throw "Invalid texture context";
 		#end
-		gl.bindFramebuffer(GL.FRAMEBUFFER, commonFB);
 
-		if( tex.flags.has(IsArray) )
-			gl.framebufferTextureLayer(GL.FRAMEBUFFER, GL.COLOR_ATTACHMENT0, tex.t.t, mipLevel, layer);
-		else
-			gl.framebufferTexture2D(GL.FRAMEBUFFER, GL.COLOR_ATTACHMENT0, tex.flags.has(Cube) ? CUBE_FACES[layer] : GL.TEXTURE_2D, tex.t.t, mipLevel);
-		if( tex.depthBuffer != null ) {
-			gl.framebufferRenderbuffer(GL.FRAMEBUFFER, GL.DEPTH_ATTACHMENT, GL.RENDERBUFFER, @:privateAccess tex.depthBuffer.b.r);
-			gl.framebufferRenderbuffer(GL.FRAMEBUFFER, GL.STENCIL_ATTACHMENT, GL.RENDERBUFFER, tex.depthBuffer.hasStencil() ? @:privateAccess tex.depthBuffer.b.r : null);
-		} else {
-			gl.framebufferRenderbuffer(GL.FRAMEBUFFER, GL.DEPTH_ATTACHMENT, GL.RENDERBUFFER, null);
-			gl.framebufferRenderbuffer(GL.FRAMEBUFFER, GL.STENCIL_ATTACHMENT, GL.RENDERBUFFER, null);
-		}
+		var fbo = getFramebuffer([tex]);
+		bindFramebuffer(fbo);
 		gl.viewport(0, 0, tex.width >> mipLevel, tex.height >> mipLevel);
-		for( i in 0...boundTextures.length )
-			boundTextures[i] = null;
-
-		#if js
-		if( glDebug ) {
-			var code = gl.checkFramebufferStatus(GL.FRAMEBUFFER);
-			if( code != GL.FRAMEBUFFER_COMPLETE )
-				throw "Invalid frame buffer: "+code;
-		}
-		#end
 	}
 
-	override function setRenderTargets( textures : Array<h3d.mat.Texture> ) {
-		unbindTargets();
-		setRenderTarget(textures[0]);
-		if( textures.length < 2 )
-			return;
-		numTargets = textures.length;
-		for( i in 1...textures.length ) {
+	override function setRenderTargets( textures : Array<h3d.mat.Texture> ) {	
+		for( i in 0...textures.length ) {
 			var tex = textures[i];
 			if( tex.t == null )
 				tex.alloc();
@@ -1501,11 +1630,14 @@ class GlDriver extends Driver {
 			if( tex.t.driver != this )
 				throw "Invalid texture context";
 			#end
-			gl.framebufferTexture2D(GL.FRAMEBUFFER, GL.COLOR_ATTACHMENT0 + i, GL.TEXTURE_2D, tex.t.t, 0);
-			curTargets[i] = tex;
 			tex.lastFrame = frame;
 			tex.flags.set(WasCleared); // once we draw to, do not clear again
 		}
+		// Aquire framebuffer based on textures
+		var fbo = getFramebuffer(textures);
+
+		bindFramebuffer(fbo);
+
 		setDrawBuffers(textures.length);
 	}
 
